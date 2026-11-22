@@ -39,6 +39,8 @@
       if (!ctx) {
         const AC = window.AudioContext || window.webkitAudioContext;
         if (!AC) return null;
+        // iPhone/iPad: let sound play even when the ringer switch is on silent (iOS 17+)
+        try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { /* */ }
         ctx = new AC();
         master = ctx.createGain(); master.gain.value = 0.22; master.connect(ctx.destination);
         noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 1.5, ctx.sampleRate);
@@ -85,7 +87,7 @@
           break;
       }
     }
-    return { play, unlock };
+    return { play, unlock, ctx: () => ctx };
   })();
 
   /* ---------------- read-aloud voice ---------------- */
@@ -104,16 +106,77 @@
     }
     if (synth) { pick(); if (synth.addEventListener) synth.addEventListener('voiceschanged', pick); else synth.onvoiceschanged = pick; }
 
-    function speak(text, onEnd) {
-      const my = ++token;
-      let fired = false, timer;
-      const finish = () => {
-        if (fired) return; fired = true; clearTimeout(timer);
-        if (my === token) { Talk.stop(); if (onEnd) onEnd(); }
+    // recorded clips (voice/<id>.mp3) are played through WebAudio; decoded clips are kept in memory
+    const LINES = window.VOICE_LINES || {};
+    const bufs = {}, loading = {};
+    let src = null, analyser = null, levelData = null, el = null;
+    function load(id, cb) {
+      if (bufs[id]) { cb(bufs[id]); return; }
+      (loading[id] = loading[id] || []).push(cb);
+      if (loading[id].length > 1) return;
+      const done = b => { const l = loading[id] || []; delete loading[id]; if (b) bufs[id] = b; l.forEach(f => f(b)); };
+      const ctx = Sfx.ctx();
+      if (!ctx) { done(null); return; }
+      const x = new XMLHttpRequest();                 // XHR + callback decode: works on old Safari too
+      x.open('GET', 'voice/' + id + '.mp3'); x.responseType = 'arraybuffer';
+      x.onload = () => {
+        if (x.status && x.status !== 200) { done(null); return; }
+        try {
+          const p = ctx.decodeAudioData(x.response, done, () => done(null));
+          if (p && p.catch) p.catch(() => done(null));
+        } catch (e) { done(null); }
       };
-      const est = 700 + text.length * 62;
-      if (!synth || save.muted) { timer = setTimeout(finish, est); return; }
-      timer = setTimeout(finish, est + 5000);           // safety net if onend never fires
+      x.onerror = () => done(null);
+      x.send();
+    }
+    // which clip(s) say this text: one clip, or two back to back ("Hi! I'm Saturn!" + "Tap a bubble…")
+    function clipsFor(text) {
+      if (LINES[text]) return [LINES[text]];
+      for (let i = text.indexOf(' '); i > 0; i = text.indexOf(' ', i + 1)) {
+        const a = LINES[text.slice(0, i)], b = LINES[text.slice(i + 1)];
+        if (a && b) return [a, b];
+      }
+      return null;
+    }
+    // warm up the clips we are about to need (e.g. while the rocket flies)
+    function preload(texts) {
+      if (Sfx.ctx()) texts.forEach(t => (clipsFor(t) || []).forEach(id => load(id, () => {})));
+    }
+
+    function stopClip() {
+      if (src) { try { src.onended = null; src.stop(); } catch (e) { /* already stopped */ } src = null; }
+      if (el) { el.onended = el.onerror = null; try { el.pause(); } catch (e) { /* */ } }
+    }
+    function playBuffer(buf, finish) {
+      const ctx = Sfx.ctx();
+      if (!analyser) {
+        analyser = ctx.createAnalyser(); analyser.fftSize = 512;
+        levelData = new Uint8Array(analyser.fftSize);
+        analyser.connect(ctx.destination);
+      }
+      src = ctx.createBufferSource(); src.buffer = buf;
+      src.connect(analyser);
+      src.onended = finish;
+      src.start(0);
+    }
+    // no WebAudio at all (very old browser): plain <audio>
+    function playElement(id, finish, fail) {
+      if (!el) el = new Audio();
+      el.onended = finish; el.onerror = fail;
+      el.src = 'voice/' + id + '.mp3';
+      const p = el.play();
+      if (p && p.catch) p.catch(fail);
+    }
+    // mouth opening 0..1 from the clip's loudness (null when we can't measure it)
+    function level() {
+      if (!src || !analyser) return null;
+      analyser.getByteTimeDomainData(levelData);
+      let s = 0;
+      for (let i = 0; i < levelData.length; i++) { const v = (levelData[i] - 128) / 128; s += v * v; }
+      return Math.sqrt(s / levelData.length);
+    }
+
+    function synthSpeak(text, finish, est) {
       try {
         synth.cancel(); synth.resume();
         const u = new SpeechSynthesisUtterance(text);
@@ -122,10 +185,58 @@
         u.onend = finish; u.onerror = finish;
         keep.push(u); if (keep.length > 6) keep.shift();   // stop Chrome dropping callbacks
         synth.speak(u);
-      } catch (e) { clearTimeout(timer); timer = setTimeout(finish, est); }
+        return true;
+      } catch (e) { return false; }
     }
-    function stop() { token++; Talk.stop(); if (synth) synth.cancel(); }
-    return { speak, stop };
+
+    function speak(text, onEnd) {
+      const my = ++token;
+      let fired = false, timer;
+      const finish = () => {
+        if (fired) return; fired = true; clearTimeout(timer);
+        if (my === token) { src = null; Talk.stop(); if (onEnd) onEnd(); }
+      };
+      const est = 700 + text.length * 62;
+      stopClip(); if (synth) synth.cancel();
+      if (save.muted) { timer = setTimeout(finish, est); return; }
+      timer = setTimeout(finish, est + 6000);           // safety net if no "ended" ever arrives
+      const fallback = () => {
+        if (my !== token || fired) return;
+        clearTimeout(timer);
+        if (synth && synthSpeak(text, finish)) timer = setTimeout(finish, est + 5000);
+        else timer = setTimeout(finish, est);
+      };
+      const ids = clipsFor(text);
+      if (!ids) { fallback(); return; }
+      if (Sfx.ctx()) {
+        const got = [];
+        let left = ids.length;
+        ids.forEach((id, i) => load(id, buf => {
+          got[i] = buf;
+          if (--left || my !== token || fired) return;
+          if (got.some(b => !b)) { fallback(); return; }
+          clearTimeout(timer);
+          timer = setTimeout(finish, got.reduce((s, b) => s + b.duration, 0) * 1000 + 1500);
+          let k = 0;
+          const next = () => {
+            if (my !== token || fired) return;
+            if (k === got.length) { finish(); return; }
+            try { playBuffer(got[k++], () => setTimeout(next, k < got.length ? 180 : 0)); } catch (e) { fallback(); }
+          };
+          next();
+        }));
+      } else {
+        let k = 0;
+        const next = () => {
+          if (my !== token || fired) return;
+          if (k === ids.length) { finish(); return; }
+          try { playElement(ids[k++], next, fallback); } catch (e) { fallback(); }
+        };
+        next();
+      }
+    }
+    function stop() { token++; stopClip(); Talk.stop(); if (synth) synth.cancel(); }
+    return { speak, stop, preload, level };
   })();
 
   /* make the close-up planet "talk" while the voice speaks */
@@ -133,7 +244,13 @@
     let iv = null, svg = null;
     function start(s) {
       stop(); svg = s; if (!svg || reduceMotion) return;
-      iv = setInterval(() => svg.classList.toggle('happy-mouth'), 170);
+      let n = 0, open = false;
+      iv = setInterval(() => {
+        const lv = Voice.level();
+        // with a recorded clip the mouth follows the voice; otherwise it just flaps
+        const want = lv == null ? (n++ % 4 < 2) : (open ? lv > 0.035 : lv > 0.06);
+        if (want !== open) { open = want; svg.classList.toggle('happy-mouth', open); }
+      }, 60);
     }
     function stop() { clearInterval(iv); iv = null; if (svg) svg.classList.remove('happy-mouth'); }
     return { start, stop };
@@ -281,6 +398,8 @@
     maybeFullscreen();
     const cd = $('#countdown');
     Voice.speak('Three, two, one. Blast off!');
+    Voice.preload(["Here is our solar system! Tap a planet, and let's fly there!",
+      "Hi! I'm Pip, your rocket! Tap a planet, and I'll fly you there!", "Tap a planet, and let's fly there!"]);
     pad.classList.add('shake');
     let n = 3;
     const step = () => {
@@ -474,11 +593,19 @@
     resetIdle();
   }
 
+  // every recorded line a planet's close-up can say (fetched ahead so it plays instantly)
+  function bodyLines(key) {
+    const b = BY_KEY[key];
+    return [b.hello, b.hello + ' Tap a bubble to hear about me!', b.play, ...b.facts.map(f => f.text),
+      `Yay! You got the ${flyName(key)} sticker!`, `Let's fly to ${flyName(key)}!`];
+  }
+
   function pickBody(key) {
     if (busy || screen !== 'map') return;
     busy = true; hideHand(); clearTimeout(idleT);
     Sfx.play('tap');
     Voice.speak(`Let's fly to ${flyName(key)}!`);
+    Voice.preload(bodyLines(key));
     const el = planetEls[key];
     el.classList.remove('picked'); void el.offsetWidth; el.classList.add('picked');
     if (key === 'sun') {
@@ -607,6 +734,9 @@
     if (screen !== 'detail') show('detail');
     const first = heard.length === 0;
     planetSays(b.hello + (first ? ' Tap a bubble to hear about me!' : ''));
+    Voice.preload(bodyLines(key));
+    const ni = ORDER.indexOf(key);           // neighbours, ready for the arrows
+    Voice.preload(bodyLines(ORDER[(ni + 1) % ORDER.length]).slice(0, 2));
     resetIdle();
   }
 
